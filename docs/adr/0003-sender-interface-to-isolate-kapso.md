@@ -17,6 +17,6 @@ outside `senders/kapso.py` imports Kapso-specific code.
 
 ## Consequences
 
-- Reminder and discovery jobs are testable without network access.
+- Reminder, digest and heartbeat jobs are testable without network access.
 - Changing or replacing Kapso touches one module.
 - The interface must stay minimal; Kapso-only features need an explicit decision before leaking in.

@@ -20,7 +20,7 @@ Timezone for all user-facing times: Europe/Dublin. Store timestamps as UTC (`tim
 - Python 3.12, `uv` for dependency management
 - FastAPI (webhook API), Pydantic for schemas
 - Postgres 16 (local via Docker Compose), plain SQL migrations in `migrations/`
-- MCP Python SDK for the events MCP server
+- MCP Python SDK for the ingest MCP (public) and the agent's internal tools
 - Anthropic SDK (tool use) for the agent
 - Kapso for WhatsApp (webhooks in, MCP/API out)
 - pytest, ruff, pre-commit, GitHub Actions
@@ -31,12 +31,13 @@ Timezone for all user-facing times: Europe/Dublin. Store timestamps as UTC (`tim
 src/events_assistant/
   domain/        # state machine, reminder rules (pure Python, no I/O)
   db/            # repositories, SQL
-  mcp_server/    # events MCP server: domain tools
+  mcp_server/    # ingest MCP (public, 3 tools) + chat agent tools (internal, never exposed)
   agent/         # system prompt, tool loop, preference handling
-  jobs/          # reminder_job, discovery_job
-  api/           # FastAPI webhook for Kapso
+  jobs/          # reminder_job, digest_job, heartbeat
+  api/           # one FastAPI app: /webhooks/kapso + /mcp (ingest)
   senders/       # WhatsApp sender interface + console fake + Kapso impl
 migrations/
+prompts/         # discovery.md: prompt for the weekly Claude scheduled task
 tests/
 evals/           # reply -> expected tool call cases
 docs/            # PRD.md, ARCHITECTURE.md, adr/

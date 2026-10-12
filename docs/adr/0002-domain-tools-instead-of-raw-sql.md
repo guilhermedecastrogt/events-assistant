@@ -12,10 +12,12 @@ statements after a misread reply or a prompt injection hidden in event descripti
 
 ## Decision
 
-The agent and the Events MCP server expose only domain tools (`save_event`, `get_event`,
-`list_my_events`, `set_status`, `snooze`, `record_preference`, `list_preferences`, ...). Each tool
-validates input with Pydantic and calls repository functions that run the state machine and write
-status and reminders in one transaction. There is no generic query tool.
+Both tool surfaces expose only domain tools: the agent's internal tools (`get_event`,
+`list_my_events`, `set_status`, `snooze`, `record_preference`, `list_preferences`, ...) and the
+public ingest MCP (`submit_events`, `get_search_preferences`, `list_known_event_urls`; see
+[0006](0006-public-mcp-exposes-ingest-only.md)). Each tool validates input with Pydantic and calls
+repository functions that run the state machine and write status and reminders in one transaction.
+There is no generic query tool.
 
 ## Consequences
 
