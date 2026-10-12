@@ -57,6 +57,7 @@ Requirements: Docker and [uv](https://docs.astral.sh/uv/getting-started/installa
 cp .env.example .env              # local defaults match docker-compose.yml
 docker compose up -d db           # Postgres 16 on localhost:5432
 uv sync                           # install dependencies into .venv
+uv run python -m events_assistant.db.migrate   # apply SQL migrations
 uv run pre-commit install         # ruff lint + format on every commit
 uv run pytest --cov               # run the test suite with coverage
 uv run ruff check . && uv run ruff format --check .

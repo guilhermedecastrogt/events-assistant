@@ -151,6 +151,14 @@ Key constraints:
 - `my_events.digested_at` NULL -> event not yet sent in a digest.
 - `ingest_runs` is append-only: the heartbeat reads `max(received_at)`, and it's the first place to
   look when a week looks wrong (counts + rejection reasons).
+- Enums (`status`, `kind`, `direction`) are `text` + `CHECK`, not Postgres ENUM types.
+- `events.ends_at >= starts_at`; `reminders` can't be both sent and canceled.
+- `ingest_runs`: counts are `>= 0` and `accepted + duplicates + filtered + rejected = submitted`;
+  `rejections` must be a JSON array.
+- Deleting an event cascades to `my_events` and `reminders` and sets `messages.event_id` to NULL.
+
+Schema lives in `migrations/NNN_name.sql`, applied by `python -m events_assistant.db.migrate`
+(tracked with checksums in `schema_migrations`; never edit an applied migration, add a new one).
 
 ## State machine (my_events.status)
 
