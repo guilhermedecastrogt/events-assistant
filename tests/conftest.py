@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator
 import psycopg
 import pytest
 from dotenv import load_dotenv
+from events_assistant.db.migrate import apply_migrations, default_migrations_dir
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 
@@ -65,3 +66,29 @@ def fresh_database_url(admin_url: str) -> Iterator[Callable[[], str]]:
     yield factory
     for name in created:
         _drop_database(admin_url, name)
+
+
+@pytest.fixture(scope="session")
+def migrated_database_url(admin_url: str) -> Iterator[str]:
+    """One database per test session with all migrations applied."""
+    name, url = _create_database(admin_url)
+    try:
+        with psycopg.connect(url, autocommit=True) as conn:
+            apply_migrations(conn, default_migrations_dir())
+        yield url
+    finally:
+        _drop_database(admin_url, name)
+
+
+@pytest.fixture
+def db(migrated_database_url: str) -> Iterator[psycopg.Connection]:
+    """Connection to the migrated database; everything is rolled back after the test.
+
+    Wrap statements expected to fail in ``db.transaction()`` so the error only aborts a
+    savepoint, not the whole test transaction.
+    """
+    with psycopg.connect(migrated_database_url) as conn:
+        try:
+            yield conn
+        finally:
+            conn.rollback()
