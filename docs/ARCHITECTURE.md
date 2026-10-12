@@ -148,7 +148,8 @@ ingest_runs(id, received_at, submitted, accepted, duplicates, filtered, rejected
 Key constraints:
 - `events.source_url` unique -> ingest is idempotent; resubmitting the same event is a `duplicate`.
 - `reminders UNIQUE(event_id, kind, due_at) WHERE canceled_at IS NULL` + `sent_at` -> no duplicate
-  sends; a canceled reminder can be recreated (e.g. cancelled, then going again).
+  sends. Canceled rows don't count, so canceling never blocks a later identical reminder
+  (e.g. a future "reopen" action); today `declined`/`cancelled` are final.
 - `reminders UNIQUE(event_id, kind) WHERE sent_at IS NULL AND canceled_at IS NULL` -> at most one
   pending reminder per kind, so repeating a transition (double tap, webhook retry, second snooze)
   can't start a second chain. Inserts use `ON CONFLICT ... DO NOTHING`; a new snooze cancels the
@@ -175,22 +176,56 @@ migration: add a new one with a higher number. Installed (non-checkout) deployme
 
 ```
 suggested --decline--------> declined
-suggested --going_no_ticket-> going_no_ticket --got_ticket--> going_with_ticket
+suggested --going_no_ticket-> going_no_ticket --got_ticket / going_ticket--> going_with_ticket
 suggested --going_ticket----> going_with_ticket
 going_* --cancel-----------> cancelled
-any open status --event passes--> expired
+any open status --expire (event started)--> expired
 suggested/going_no_ticket --snooze--> same status, snooze_until set
 ```
 
-Ingest creates events in `suggested`. Transitions live in `domain/` as pure functions:
-`(current_status, action, now) -> (new_status, reminders_to_create, reminders_to_cancel)`.
+Ingest creates events in `suggested`. `declined`, `cancelled` and `expired` are final.
 
-| Transition | Reminders created | Reminders canceled |
+The state machine lives in `domain/` and is pure (no I/O, the clock is passed in):
+`transition(current, action, event_starts_at, now, *, snooze_days=None, policy) -> TransitionResult(new_status, reminders_to_create, reminder_kinds_to_cancel, snooze_until, changed)`.
+Actions: `decline`, `going_no_ticket`, `going_ticket`, `got_ticket`, `cancel`, `snooze`, `expire`.
+
+| Transition | Reminders created | Pending reminders canceled |
 |-----------|-------------------|--------------------|
-| -> going_no_ticket | pre_event_3d, ticket_nag (every 3 days) | none |
-| -> going_with_ticket | pre_event_3d (and optional 1d) | ticket_nag |
-| -> declined / cancelled | none | all pending |
-| snooze | snooze_resurface at snooze_until | pending snooze_resurface (a new snooze replaces it) |
+| suggested -> going_no_ticket | pre_event_3d (+ optional pre_event_1d), first ticket_nag | snooze_resurface |
+| suggested -> going_with_ticket | pre_event_3d (+1d) | ticket_nag, snooze_resurface |
+| going_no_ticket -> going_with_ticket | pre_event_3d (+1d), same `due_at` so not duplicated | ticket_nag, snooze_resurface |
+| -> declined / cancelled | none | all kinds |
+| snooze (suggested) | snooze_resurface at now + N days (default 3) | snooze_resurface (a new snooze replaces it) |
+| snooze (going_no_ticket) | snooze_resurface at now + N days | snooze_resurface, ticket_nag (the resurface is the next nudge) |
+| -> expired | none | all kinds |
+
+Rules:
+- **Reminder times.** "N days" means Europe/Dublin calendar days, so a reminder 3 days before a
+  19:00 event is at 19:00 local even across a DST change. All results are UTC.
+- **pre_event_3d** is due 3 days before `starts_at`, and only if that is still in the future. If the
+  event is less than 3 days away there's no pre-event reminder and no catch-up message.
+- **ticket_nag**: the first is 3 days after the decision, then every 3 days, strictly before the
+  pre-event window (`starts_at` - 3 days). There is one pending nag at a time; the reminder job
+  calls `next_ticket_nag(after=<previous due_at>, starts_at=..., now=...)` after sending one, and
+  after a snooze resurface for `going_no_ticket`. `after` is the previous **due** time, not the send
+  time: a late job skips missed slots and keeps the original schedule instead of stopping or drifting.
+- **Repeats.** Repeating the action that produced the current status (double tap, retry) is a
+  no-op (`changed=False`). Any other disallowed action raises `InvalidTransition`, whose message
+  lists the allowed actions.
+- **Event started.** Once `now >= starts_at`, any action on an open status other than `expire`
+  raises `EventAlreadyStarted` (repeats are still no-ops, so a late retry never errors). `expire`
+  is only valid from an open status at or after the start.
+- **Snooze** must resurface before the event starts; from `going_no_ticket` it must also resurface
+  before the pre-event window, since it replaces a ticket nudge. Otherwise `InvalidTransition`,
+  which the button handler turns into a friendly reply. It's invalid on declined, cancelled,
+  expired and going_with_ticket.
+- **snooze_until.** When `changed`, the repository writes `TransitionResult.snooze_until` to
+  `my_events.snooze_until`; `None` clears it.
+- **Applying a result** (repository, one transaction): lock the `my_events` row, re-read its status,
+  run `transition()`, update status/`status_changed_at`/`snooze_until`, cancel *pending* reminders of
+  the cancelled kinds, **then** insert new reminders with `ON CONFLICT DO NOTHING`. Cancel must come
+  first so a replacement snooze isn't swallowed by the one-pending-per-kind index.
+- Naive datetimes and unknown statuses or actions raise `ValueError`.
 
 ## Key flows
 
