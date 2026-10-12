@@ -129,9 +129,11 @@ No raw SQL tool. The agent cannot touch tables directly.
 - Managed Postgres (Neon or Supabase) in production, Docker locally.
 - Scheduling via the host's cron or GitHub Actions cron, defined in code in the repo.
 
-## Related ADRs (to write in docs/adr/)
+## Related ADRs
 
-- 0001: Reminders do not use the LLM
-- 0002: Domain tools instead of raw SQL
-- 0003: Sender interface to isolate Kapso
-- 0004: Structured buttons before free-text interpretation
+See [adr/README.md](adr/README.md).
+
+- [0001](adr/0001-reminders-do-not-use-the-llm.md): Reminders do not use the LLM
+- [0002](adr/0002-domain-tools-instead-of-raw-sql.md): Domain tools instead of raw SQL
+- [0003](adr/0003-sender-interface-to-isolate-kapso.md): Sender interface to isolate Kapso
+- [0004](adr/0004-structured-buttons-before-free-text.md): Structured buttons before free-text interpretation
