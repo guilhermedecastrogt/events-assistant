@@ -10,11 +10,12 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel runs on main: every merged commit should get a CI result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     services:
@@ -34,12 +35,15 @@ jobs:
 
     env:
       DATABASE_URL: postgresql://events:events@localhost:5432/events
+      UV_PYTHON_PREFERENCE: only-managed
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           enable-cache: true
 
@@ -51,6 +55,11 @@ jobs:
 
       - name: Format check
         run: uv run ruff format --check .
+
+      - name: Other pre-commit hooks (secrets, whitespace, yaml/toml)
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+        env:
+          SKIP: ruff-check,ruff-format
 
       - name: Tests
         run: uv run pytest --cov --cov-report=term-missing
