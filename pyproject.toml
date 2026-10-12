@@ -5,6 +5,7 @@ description = "Personal WhatsApp assistant for tech events: LLM as interface, Po
 authors = [
     { name = "Guilherme de Castro", email = "guilhermecastro1000@gmail.com" }
 ]
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary]>=3.3.6",
