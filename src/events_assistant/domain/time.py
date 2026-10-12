@@ -26,7 +26,8 @@ def shift_local_days(dt: datetime, days: int) -> datetime:
 
     "3 days before a 19:00 event" stays at 19:00 local even across a DST change, so the
     result can be 71 or 73 hours away. A wall-clock time that falls in the spring-forward
-    gap resolves with the pre-transition offset (PEP 495, fold=0).
+    gap resolves with the pre-transition offset, and one that occurs twice in autumn resolves
+    to the first occurrence (PEP 495, fold=0).
     """
     local = require_aware(dt, "dt").astimezone(LOCAL_TZ)
     return (local + timedelta(days=days)).astimezone(UTC)

@@ -27,6 +27,8 @@ class ReminderPolicy:
             value = getattr(self, field.name)
             if field.type is int and value <= 0:
                 raise ValueError(f"{field.name} must be positive, got {value}")
+        if self.pre_event_1d and self.pre_event_lead_days <= 1:
+            raise ValueError("pre_event_lead_days must be more than 1 when pre_event_1d is on")
 
 
 DEFAULT_POLICY = ReminderPolicy()
@@ -56,18 +58,25 @@ def ticket_nag_window_start(
 
 
 def next_ticket_nag(
+    *,
     after: datetime,
     starts_at: datetime,
     now: datetime,
     policy: ReminderPolicy = DEFAULT_POLICY,
 ) -> ReminderSpec | None:
-    """The ticket nag following `after` (a decision or the previous nag), if one is still due.
+    """The next ticket nag on the schedule that started at `after`, if one is still due.
 
-    Returns None once the next nag would fall at or after the pre-event window start, or if it
-    would already be in the past.
+    `after` is the decision time or the previous nag's (or snooze resurface's) `due_at`, not
+    when it was actually sent, so a late job neither stops the chain nor drifts it: missed
+    slots are skipped and the next future slot is returned. Returns None once that slot is at
+    or after the pre-event window start.
     """
+    after = require_aware(after, "after")
     now = require_aware(now, "now")
+    window_start = ticket_nag_window_start(starts_at, policy)
     due_at = shift_local_days(after, policy.ticket_nag_every_days)
-    if now < due_at < ticket_nag_window_start(starts_at, policy):
+    while due_at <= now:
+        due_at = shift_local_days(due_at, policy.ticket_nag_every_days)
+    if due_at < window_start:
         return ReminderSpec(ReminderKind.TICKET_NAG, due_at)
     return None

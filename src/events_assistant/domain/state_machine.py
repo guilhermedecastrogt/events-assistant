@@ -14,6 +14,7 @@ from events_assistant.domain.reminders import (
     ReminderSpec,
     next_ticket_nag,
     pre_event_reminders,
+    ticket_nag_window_start,
 )
 from events_assistant.domain.time import require_aware, shift_local_days, to_local
 
@@ -69,7 +70,8 @@ class TransitionResult:
     new_status: Status
     reminders_to_create: tuple[ReminderSpec, ...]
     reminder_kinds_to_cancel: frozenset[ReminderKind]  # cancel *pending* reminders of these kinds
-    snooze_until: datetime | None  # new value of my_events.snooze_until when changed
+    # When `changed`, the repository writes this to my_events.snooze_until (None -> NULL).
+    snooze_until: datetime | None
     changed: bool  # False: nothing to write (idempotent repeat)
 
 
@@ -97,6 +99,7 @@ def transition(
         if snooze_days <= 0:
             raise ValueError(f"snooze_days must be positive, got {snooze_days}")
 
+    # Repeats first: a retry must never fail, even after the event started.
     if (current, action) in NO_OPS:
         return TransitionResult(current, (), frozenset(), None, changed=False)
 
@@ -107,23 +110,33 @@ def transition(
             raise InvalidTransition(current, action, "the event has not started yet")
         return _result(Status.EXPIRED, cancel=ALL_KINDS)
 
+    # Once started, "already started" is the useful answer for any open status, rather than
+    # a list of actions that would fail too.
+    if current.is_open and now >= starts_at:
+        raise EventAlreadyStarted(current, action)
+
     new_status = TRANSITIONS.get((current, action))
     if new_status is None:
         raise InvalidTransition(current, action)
-    if now >= starts_at:
-        raise EventAlreadyStarted(current, action)
 
     if action == Action.SNOOZE:
         days = snooze_days if snooze_days is not None else policy.default_snooze_days
         until = shift_local_days(now, days)
+        when = f"{to_local(until):%a %d %b %H:%M}"
         if until >= starts_at:
-            when = f"{to_local(until):%a %d %b %H:%M}"
             raise InvalidTransition(
                 current, action, f"the event starts before then; can't snooze until {when}"
             )
         cancel = {ReminderKind.SNOOZE_RESURFACE}
         if current == Status.GOING_NO_TICKET:
-            cancel.add(ReminderKind.TICKET_NAG)  # the resurface is the next nudge
+            # The resurface replaces the next ticket nag, so it must respect the nag window.
+            if until >= ticket_nag_window_start(starts_at, policy):
+                raise InvalidTransition(
+                    current,
+                    action,
+                    f"the pre-event reminder takes over before {when}; no ticket nudges after it",
+                )
+            cancel.add(ReminderKind.TICKET_NAG)
         return _result(
             new_status,
             create=[ReminderSpec(ReminderKind.SNOOZE_RESURFACE, until)],
@@ -136,7 +149,7 @@ def transition(
 
     reminders = pre_event_reminders(starts_at, now, policy)
     if new_status == Status.GOING_NO_TICKET:
-        nag = next_ticket_nag(now, starts_at, now, policy)
+        nag = next_ticket_nag(after=now, starts_at=starts_at, now=now, policy=policy)
         return _result(
             new_status,
             create=[*reminders, *([nag] if nag else [])],
