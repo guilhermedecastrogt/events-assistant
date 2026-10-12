@@ -129,11 +129,12 @@ events(id, source, source_url UNIQUE, title, description, organizer, venue, city
 my_events(event_id PK/FK, status, status_changed_at, snooze_until,
           digested_at, ticket_url, notes)
 
-reminders(id, event_id FK, kind, due_at, sent_at, canceled_at,
-          UNIQUE(event_id, kind, due_at))
+reminders(id, event_id FK, kind, due_at, sent_at, canceled_at, created_at,
+          UNIQUE(event_id, kind, due_at) WHERE not canceled,
+          UNIQUE(event_id, kind) WHERE pending)
    kind: pre_event_3d | pre_event_1d | ticket_nag | snooze_resurface
 
-messages(id, direction, wa_message_id UNIQUE, event_id FK NULL,
+messages(id, direction, wa_message_id UNIQUE NULL, event_id FK NULL,
          quoted_wa_message_id, body, template_name, created_at)
 
 preferences(id, kind, value, weight, reason, created_at)
@@ -146,8 +147,15 @@ ingest_runs(id, received_at, submitted, accepted, duplicates, filtered, rejected
 
 Key constraints:
 - `events.source_url` unique -> ingest is idempotent; resubmitting the same event is a `duplicate`.
-- `reminders UNIQUE(event_id, kind, due_at)` + `sent_at` -> no duplicate sends.
-- `messages.wa_message_id` unique -> webhook retries are idempotent.
+- `reminders UNIQUE(event_id, kind, due_at) WHERE canceled_at IS NULL` + `sent_at` -> no duplicate
+  sends; a canceled reminder can be recreated (e.g. cancelled, then going again).
+- `reminders UNIQUE(event_id, kind) WHERE sent_at IS NULL AND canceled_at IS NULL` -> at most one
+  pending reminder per kind, so repeating a transition (double tap, webhook retry, second snooze)
+  can't start a second chain. Inserts use `ON CONFLICT ... DO NOTHING`; a new snooze cancels the
+  pending `snooze_resurface` first. `ticket_nag` is one pending row at a time: the reminder job
+  schedules the next one after sending.
+- `messages.wa_message_id` unique -> webhook retries are idempotent. It's required for inbound
+  messages and may be NULL only for an outbound row recorded before WhatsApp returns an id.
 - `my_events.digested_at` NULL -> event not yet sent in a digest.
 - `ingest_runs` is append-only: the heartbeat reads `max(received_at)`, and it's the first place to
   look when a week looks wrong (counts + rejection reasons).
@@ -158,7 +166,10 @@ Key constraints:
 - Deleting an event cascades to `my_events` and `reminders` and sets `messages.event_id` to NULL.
 
 Schema lives in `migrations/NNN_name.sql`, applied by `python -m events_assistant.db.migrate`
-(tracked with checksums in `schema_migrations`; never edit an applied migration, add a new one).
+(tracked with checksums in `schema_migrations`). Each file runs in one transaction, so files must
+not contain `BEGIN`/`COMMIT`/`ROLLBACK` or `CONCURRENTLY`. Never edit or renumber an applied
+migration: add a new one with a higher number. Installed (non-checkout) deployments set
+`MIGRATIONS_DIR`.
 
 ## State machine (my_events.status)
 
@@ -179,7 +190,7 @@ Ingest creates events in `suggested`. Transitions live in `domain/` as pure func
 | -> going_no_ticket | pre_event_3d, ticket_nag (every 3 days) | none |
 | -> going_with_ticket | pre_event_3d (and optional 1d) | ticket_nag |
 | -> declined / cancelled | none | all pending |
-| snooze | snooze_resurface at snooze_until | none |
+| snooze | snooze_resurface at snooze_until | pending snooze_resurface (a new snooze replaces it) |
 
 ## Key flows
 
