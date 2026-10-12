@@ -2,28 +2,44 @@
 
 Applies `migrations/NNN_name.sql` files in order and records each one, with a checksum, in
 `schema_migrations`. Each file runs in its own transaction together with its bookkeeping row,
-so a failing migration leaves nothing behind. A Postgres advisory lock serialises concurrent
-runners. Applied migrations must never be edited: add a new file instead.
+so a failing migration leaves nothing behind; files must therefore not contain transaction
+control (BEGIN/COMMIT/ROLLBACK) or `CONCURRENTLY`. A Postgres advisory lock (with a timeout)
+serialises concurrent runners. Applied migrations must never be edited or reordered: add a new
+file with a higher number instead.
 
 Usage: uv run python -m events_assistant.db.migrate [--dir PATH]
 """
 
 import argparse
+import contextlib
 import hashlib
 import os
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import psycopg
+from psycopg import errors, sql
 
 from events_assistant.db.connection import connect
 
 FILENAME_RE = re.compile(r"^(?P<number>\d{3})_[a-z0-9_]+\.sql$")
 
+# Statements that would break the one-transaction-per-file guarantee. Checked after removing
+# comments and dollar-quoted bodies, so PL/pgSQL `BEGIN ... END;` blocks are fine.
+FORBIDDEN_RE = re.compile(
+    r"^\s*(BEGIN|START\s+TRANSACTION|COMMIT|ROLLBACK|END)\s*;|\bCONCURRENTLY\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_DOLLAR_QUOTED_RE = re.compile(r"\$(?P<tag>[A-Za-z_]*)\$.*?\$(?P=tag)\$", re.DOTALL)
+
 # Arbitrary constant identifying this runner's advisory lock.
 ADVISORY_LOCK_KEY = 7_311_204_412
+DEFAULT_LOCK_TIMEOUT = timedelta(seconds=30)
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -47,7 +63,10 @@ class Migration:
 
 
 def default_migrations_dir() -> Path:
-    """`MIGRATIONS_DIR` if set, otherwise the repo's top-level `migrations/` directory."""
+    """`MIGRATIONS_DIR` if set, otherwise the repo's top-level `migrations/` directory.
+
+    The fallback only exists in a source checkout; installed packages must set MIGRATIONS_DIR.
+    """
     override = os.environ.get("MIGRATIONS_DIR")
     if override:
         return Path(override)
@@ -57,7 +76,9 @@ def default_migrations_dir() -> Path:
 def discover(directory: Path) -> list[Migration]:
     """Return the `.sql` migrations in `directory`, validated and sorted by version."""
     if not directory.is_dir():
-        raise MigrationError(f"migrations directory not found: {directory}")
+        raise MigrationError(
+            f"migrations directory not found: {directory} (set MIGRATIONS_DIR or pass --dir)"
+        )
 
     migrations: list[Migration] = []
     seen_numbers: dict[str, str] = {}
@@ -74,27 +95,46 @@ def discover(directory: Path) -> list[Migration]:
             )
         seen_numbers[number] = path.name
         data = path.read_bytes()
+        text = data.decode("utf-8")
+        _check_no_transaction_control(path.name, text)
         migrations.append(
             Migration(
                 version=path.stem,
                 path=path,
-                sql=data.decode("utf-8"),
+                sql=text,
                 checksum=hashlib.sha256(data).hexdigest(),
             )
         )
     return migrations
 
 
-def apply_migrations(conn: psycopg.Connection, directory: Path) -> list[str]:
+def _check_no_transaction_control(name: str, text: str) -> None:
+    stripped = _DOLLAR_QUOTED_RE.sub("", _COMMENT_RE.sub("", text))
+    found = FORBIDDEN_RE.search(stripped)
+    if found:
+        raise MigrationError(
+            f"{name} contains transaction control ({found.group(0).strip()!r}); each migration "
+            "already runs in its own transaction"
+        )
+
+
+def apply_migrations(
+    conn: psycopg.Connection,
+    directory: Path,
+    *,
+    lock_timeout: timedelta = DEFAULT_LOCK_TIMEOUT,
+    on_applied: Callable[[str], None] | None = None,
+) -> list[str]:
     """Apply pending migrations from `directory`; return the versions applied in this call.
 
     `conn` must be in autocommit mode so each migration gets its own real transaction.
+    `on_applied` is called with each version right after it commits.
     """
     if not conn.autocommit:
         raise ValueError("apply_migrations needs an autocommit connection")
 
     migrations = discover(directory)
-    conn.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+    _acquire_lock(conn, lock_timeout)
     try:
         conn.execute(CREATE_TABLE_SQL)
         applied = dict(conn.execute("SELECT version, checksum FROM schema_migrations").fetchall())
@@ -114,9 +154,27 @@ def apply_migrations(conn: psycopg.Connection, directory: Path) -> list[str]:
             except psycopg.Error as exc:
                 raise MigrationError(f"migration {migration.version} failed: {exc}") from exc
             newly_applied.append(migration.version)
+            if on_applied:
+                on_applied(migration.version)
         return newly_applied
     finally:
-        conn.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+        # A broken connection already released the session lock; never mask the real error.
+        if not conn.closed and not conn.broken:
+            with contextlib.suppress(psycopg.Error):
+                conn.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+
+
+def _acquire_lock(conn: psycopg.Connection, timeout: timedelta) -> None:
+    timeout_ms = max(1, int(timeout.total_seconds() * 1000))
+    conn.execute(sql.SQL("SET lock_timeout = {}").format(sql.Literal(f"{timeout_ms}ms")))
+    try:
+        conn.execute("SELECT pg_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+    except errors.LockNotAvailable as exc:
+        raise MigrationError(
+            f"could not get the migration lock within {timeout}; is another run stuck?"
+        ) from exc
+    finally:
+        conn.execute("RESET lock_timeout")
 
 
 def _check_applied(migrations: list[Migration], applied: dict[str, str]) -> None:
@@ -129,6 +187,14 @@ def _check_applied(migrations: list[Migration], applied: dict[str, str]) -> None
             raise MigrationError(
                 f"migration {version} changed after it was applied; add a new migration instead"
             )
+    if applied:
+        latest = max(applied)
+        early = [m.version for m in migrations if m.version not in applied and m.version < latest]
+        if early:
+            raise MigrationError(
+                f"pending migrations {early} are out of order (latest applied is {latest}); "
+                "renumber them after it"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -137,18 +203,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     directory = args.dir or default_migrations_dir()
 
+    def report(version: str) -> None:
+        print(f"applied {version}", flush=True)
+
     try:
         discover(directory)  # fail fast on malformed files before connecting
         with connect(autocommit=True) as conn:
-            applied = apply_migrations(conn, directory)
-    except MigrationError as exc:
+            applied = apply_migrations(conn, directory, on_applied=report)
+    except (MigrationError, psycopg.Error, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    if applied:
-        for version in applied:
-            print(f"applied {version}")
-    else:
+    if not applied:
         print("database is up to date")
     return 0
 

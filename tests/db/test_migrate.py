@@ -159,13 +159,15 @@ def test_failing_migration_rolls_back_completely(tmp_path, fresh_database_url):
 def test_lock_is_released_after_a_failed_migration(tmp_path, fresh_database_url):
     _write(tmp_path, "001_bad.sql", "SELECT * FROM missing_table;")
     url = fresh_database_url()
-    with psycopg.connect(url, autocommit=True) as conn, pytest.raises(MigrationError):
-        apply_migrations(conn, tmp_path)
-        with psycopg.connect(url, autocommit=True) as other:
-            (got,) = other.execute(
-                "SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,)
-            ).fetchone()
-            assert got is True
+    with (
+        psycopg.connect(url, autocommit=True) as conn,
+        psycopg.connect(url, autocommit=True) as other,
+    ):
+        with pytest.raises(MigrationError):
+            apply_migrations(conn, tmp_path)
+        # conn is still open, so if it had kept the session lock this would return false.
+        (got,) = other.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,)).fetchone()
+        assert got is True
 
 
 @pytest.mark.integration

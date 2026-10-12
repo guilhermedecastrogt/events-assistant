@@ -3,12 +3,12 @@
 import os
 
 import psycopg
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 
 def get_database_url() -> str:
-    """Return DATABASE_URL from the environment (or `.env`), failing loudly if unset."""
-    load_dotenv()
+    """Return DATABASE_URL from the environment or the nearest `.env` (searched from the cwd)."""
+    load_dotenv(find_dotenv(usecwd=True))
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set; copy .env.example to .env or export it")
