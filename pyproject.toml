@@ -45,6 +45,9 @@ select = [
     "S",   # flake8-bandit (security)
 ]
 
+[tool.ruff.lint.isort]
+known-first-party = ["events_assistant"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]  # asserts are fine in tests
 

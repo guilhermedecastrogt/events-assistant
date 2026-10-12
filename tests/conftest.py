@@ -12,9 +12,10 @@ from collections.abc import Callable, Iterator
 import psycopg
 import pytest
 from dotenv import load_dotenv
-from events_assistant.db.migrate import apply_migrations, default_migrations_dir
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
+
+from events_assistant.db.migrate import apply_migrations, default_migrations_dir
 
 load_dotenv()
 

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import psycopg
 import pytest
+
+from events_assistant.db import connection
 from events_assistant.db.migrate import (
     MigrationError,
     apply_migrations,
@@ -12,8 +14,6 @@ from events_assistant.db.migrate import (
     discover,
     main,
 )
-
-from events_assistant.db import connection
 
 EXPECTED_TABLES = {
     "events",
