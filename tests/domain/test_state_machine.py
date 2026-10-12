@@ -194,12 +194,30 @@ def test_snooze_on_declined_event_is_invalid():
         go(S.DECLINED, A.SNOOZE)
     assert exc_info.value.current == S.DECLINED
     assert exc_info.value.action == A.SNOOZE
+    assert not isinstance(exc_info.value, EventAlreadyStarted)
 
 
-def test_snooze_past_event_start_is_invalid():
-    starts_at = NOW + timedelta(days=2)
+@pytest.mark.parametrize("lead", [timedelta(days=2), timedelta(days=3)])  # before / exactly at
+def test_snooze_must_resurface_before_the_event(lead):
     with pytest.raises(InvalidTransition, match="starts before"):
-        go(S.SUGGESTED, A.SNOOZE, starts_at=starts_at)
+        go(S.SUGGESTED, A.SNOOZE, starts_at=NOW + lead)
+
+
+def test_snooze_going_no_ticket_must_resurface_before_the_pre_event_window():
+    # Event 4 days away: a 3-day snooze would nudge about tickets after the pre-event reminder.
+    starts_at = NOW + timedelta(days=4)
+    with pytest.raises(InvalidTransition, match="pre-event reminder"):
+        go(S.GOING_NO_TICKET, A.SNOOZE, starts_at=starts_at)
+    # A suggested event can still be snoozed to the same time.
+    assert go(S.SUGGESTED, A.SNOOZE, starts_at=starts_at).changed
+
+
+def test_changed_transitions_clear_snooze_until():
+    snoozed = go(S.SUGGESTED, A.SNOOZE)
+    assert snoozed.snooze_until is not None
+    going = go(snoozed.new_status, A.GOING_TICKET)
+    assert going.snooze_until is None  # repository writes NULL
+    assert K.SNOOZE_RESURFACE in going.reminder_kinds_to_cancel
 
 
 @pytest.mark.parametrize("days", [0, -1])
@@ -248,18 +266,20 @@ def test_expire_after_event_starts(current):
 
 
 @pytest.mark.parametrize("current", OPEN)
+def test_expire_exactly_at_start_is_allowed(current):
+    assert go(current, A.EXPIRE, now=TEN_DAYS_AWAY).new_status == S.EXPIRED
+
+
+@pytest.mark.parametrize(("current", "action"), sorted(CHANGING))
+def test_actions_exactly_at_start_raise_event_already_started(current, action):
+    with pytest.raises(EventAlreadyStarted):
+        go(current, action, now=TEN_DAYS_AWAY)
+
+
+@pytest.mark.parametrize("current", OPEN)
 def test_expire_before_event_starts_is_invalid(current):
     with pytest.raises(InvalidTransition, match="has not started"):
         go(current, A.EXPIRE)
-
-
-@pytest.mark.parametrize(
-    ("current", "action"),
-    [(c, a) for (c, a) in CHANGING],
-)
-def test_actions_after_event_started_raise(current, action):
-    with pytest.raises(EventAlreadyStarted, match="already started"):
-        go(current, action, now=TEN_DAYS_AWAY + timedelta(hours=1))
 
 
 @pytest.mark.parametrize("current", [S.DECLINED, S.CANCELLED])
@@ -282,12 +302,10 @@ def test_repeating_an_action_is_a_no_op(current, action):
     )
 
 
-def test_double_tap_going_no_ticket_does_not_restart_the_nag_chain():
-    first = go(S.SUGGESTED, A.GOING_NO_TICKET)
-    later = NOW + timedelta(hours=2)
-    second = go(first.new_status, A.GOING_NO_TICKET, now=later)
-    assert not second.changed
-    assert second.reminders_to_create == ()
+@pytest.mark.parametrize(("current", "action"), sorted(NO_OPS))
+def test_repeats_stay_no_ops_after_the_event_starts(current, action):
+    # A webhook retry processed after the start must never error.
+    assert not go(current, action, now=TEN_DAYS_AWAY + timedelta(hours=1)).changed
 
 
 # --- full matrix -------------------------------------------------------------------
@@ -316,9 +334,14 @@ def test_transition_matrix_started_event(current, action):
         assert go(current, action, now=now).new_status == S.EXPIRED
     elif (current, action) in NO_OPS:
         assert not go(current, action, now=now).changed
-    else:
-        with pytest.raises(InvalidTransition):
+    elif current.is_open:
+        # Even actions the table never allows: the useful message is "already started".
+        with pytest.raises(EventAlreadyStarted, match="already started"):
             go(current, action, now=now)
+    else:
+        with pytest.raises(InvalidTransition, match="is final") as exc_info:
+            go(current, action, now=now)
+        assert type(exc_info.value) is InvalidTransition
 
 
 def test_invalid_transition_message_is_actionable():

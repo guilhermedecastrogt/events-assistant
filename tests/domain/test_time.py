@@ -52,6 +52,9 @@ def test_to_local_rejects_naive():
         (datetime(2026, 10, 27, 19, 0, tzinfo=UTC), -3, datetime(2026, 10, 24, 18, 0, tzinfo=UTC)),
         # Landing in the spring gap (01:30 local doesn't exist): resolved, not an error.
         (datetime(2026, 3, 26, 1, 30, tzinfo=UTC), 3, datetime(2026, 3, 29, 1, 30, tzinfo=UTC)),
+        # Landing on the repeated autumn hour (01:30 happens twice on 25 Oct): the first one
+        # (IST, 00:30 UTC) is used.
+        (datetime(2026, 10, 28, 1, 30, tzinfo=UTC), -3, datetime(2026, 10, 25, 0, 30, tzinfo=UTC)),
     ],
 )
 def test_shift_local_days_keeps_dublin_wall_clock(start, days, expected):

@@ -57,29 +57,75 @@ def test_ticket_nag_window_starts_at_the_pre_event_reminder():
     assert ticket_nag_window_start(TEN_DAYS_AWAY) == datetime(2026, 11, 9, 19, 0, tzinfo=UTC)
 
 
+def nag_at(*args) -> ReminderSpec:
+    return ReminderSpec(ReminderKind.TICKET_NAG, datetime(*args, tzinfo=UTC))
+
+
 def test_ticket_nag_chain_every_three_days_until_the_window():
-    first = next_ticket_nag(NOW, TEN_DAYS_AWAY, NOW)
-    assert first == ReminderSpec(ReminderKind.TICKET_NAG, datetime(2026, 11, 5, 10, tzinfo=UTC))
-    second = next_ticket_nag(first.due_at, TEN_DAYS_AWAY, first.due_at)
-    assert second == ReminderSpec(ReminderKind.TICKET_NAG, datetime(2026, 11, 8, 10, tzinfo=UTC))
+    first = next_ticket_nag(after=NOW, starts_at=TEN_DAYS_AWAY, now=NOW)
+    assert first == nag_at(2026, 11, 5, 10)
+    second = next_ticket_nag(after=first.due_at, starts_at=TEN_DAYS_AWAY, now=first.due_at)
+    assert second == nag_at(2026, 11, 8, 10)
     # 11 Nov 10:00 is inside the pre-event window (from 9 Nov 19:00): the chain stops.
-    assert next_ticket_nag(second.due_at, TEN_DAYS_AWAY, second.due_at) is None
+    assert next_ticket_nag(after=second.due_at, starts_at=TEN_DAYS_AWAY, now=second.due_at) is None
 
 
 def test_ticket_nag_exactly_at_window_start_is_skipped():
     starts_at = NOW + timedelta(days=6)  # window starts NOW + 3 days, same as the nag
-    assert next_ticket_nag(NOW, starts_at, NOW) is None
+    assert next_ticket_nag(after=NOW, starts_at=starts_at, now=NOW) is None
 
 
-def test_ticket_nag_not_due_in_the_past():
-    long_ago = NOW - timedelta(days=5)
-    assert next_ticket_nag(long_ago, TEN_DAYS_AWAY, NOW) is None
+def test_late_job_continues_the_chain_on_the_original_schedule():
+    # Nag was due 5 Nov 10:00 but the job only ran on 6 Nov 11:00.
+    event = datetime(2026, 11, 30, 19, 0, tzinfo=UTC)
+    late = datetime(2026, 11, 6, 11, 0, tzinfo=UTC)
+    nag = next_ticket_nag(after=datetime(2026, 11, 5, 10, tzinfo=UTC), starts_at=event, now=late)
+    assert nag == nag_at(2026, 11, 8, 10)
+
+
+def test_job_late_by_several_intervals_skips_missed_nags():
+    event = datetime(2026, 11, 30, 19, 0, tzinfo=UTC)
+    very_late = datetime(2026, 11, 12, 9, 0, tzinfo=UTC)  # missed 8 Nov and 11 Nov
+    nag = next_ticket_nag(
+        after=datetime(2026, 11, 5, 10, tzinfo=UTC), starts_at=event, now=very_late
+    )
+    assert nag == nag_at(2026, 11, 14, 10)
+
+
+def test_late_job_inside_the_window_stops_the_chain():
+    nag = next_ticket_nag(
+        after=datetime(2026, 11, 5, 10, tzinfo=UTC),
+        starts_at=TEN_DAYS_AWAY,
+        now=datetime(2026, 11, 10, 0, 0, tzinfo=UTC),  # already in the pre-event window
+    )
+    assert nag is None
+
+
+def test_nag_chain_resumes_after_a_snooze_resurface():
+    resurface_due = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
+    event = datetime(2026, 12, 10, 19, 0, tzinfo=UTC)
+    nag = next_ticket_nag(after=resurface_due, starts_at=event, now=resurface_due)
+    assert nag == nag_at(2026, 11, 23, 10)
 
 
 def test_custom_nag_interval():
     policy = ReminderPolicy(ticket_nag_every_days=2)
-    nag = next_ticket_nag(NOW, TEN_DAYS_AWAY, NOW, policy)
+    nag = next_ticket_nag(after=NOW, starts_at=TEN_DAYS_AWAY, now=NOW, policy=policy)
     assert nag == ReminderSpec(ReminderKind.TICKET_NAG, NOW + timedelta(days=2))
+
+
+def test_custom_lead_days_move_the_nag_window():
+    policy = ReminderPolicy(pre_event_lead_days=5)
+    assert ticket_nag_window_start(TEN_DAYS_AWAY, policy) == datetime(2026, 11, 7, 19, tzinfo=UTC)
+    second = next_ticket_nag(
+        after=datetime(2026, 11, 5, 10, tzinfo=UTC), starts_at=TEN_DAYS_AWAY, now=NOW, policy=policy
+    )
+    assert second is None  # 8 Nov is after the 7 Nov window start
+
+
+def test_next_ticket_nag_arguments_are_keyword_only():
+    with pytest.raises(TypeError):
+        next_ticket_nag(NOW, TEN_DAYS_AWAY, NOW)  # type: ignore[misc]
 
 
 def test_spring_dst_pre_event_keeps_local_time():
@@ -104,8 +150,8 @@ def test_spring_dst_ticket_nag_keeps_local_time():
     # Thu 26 Mar 10:00 GMT -> Sun 29 Mar 10:00 IST (09:00 UTC).
     now = datetime(2026, 3, 26, 10, 0, tzinfo=UTC)
     starts_at = datetime(2026, 4, 20, 18, 0, tzinfo=UTC)
-    nag = next_ticket_nag(now, starts_at, now)
-    assert nag == ReminderSpec(ReminderKind.TICKET_NAG, datetime(2026, 3, 29, 9, 0, tzinfo=UTC))
+    nag = next_ticket_nag(after=now, starts_at=starts_at, now=now)
+    assert nag == nag_at(2026, 3, 29, 9, 0)
 
 
 @pytest.mark.parametrize("func", ["pre_event_reminders", "next_ticket_nag"])
@@ -115,7 +161,7 @@ def test_naive_datetimes_rejected(func):
         if func == "pre_event_reminders":
             pre_event_reminders(naive, NOW)
         else:
-            next_ticket_nag(NOW, naive, NOW)
+            next_ticket_nag(after=NOW, starts_at=naive, now=NOW)
 
 
 @pytest.mark.parametrize(
@@ -129,3 +175,8 @@ def test_naive_datetimes_rejected(func):
 def test_policy_rejects_non_positive_days(kwargs):
     with pytest.raises(ValueError, match="positive"):
         ReminderPolicy(**kwargs)
+
+
+def test_policy_rejects_day_before_reminder_overlapping_the_lead_reminder():
+    with pytest.raises(ValueError, match="pre_event_lead_days"):
+        ReminderPolicy(pre_event_lead_days=1, pre_event_1d=True)
