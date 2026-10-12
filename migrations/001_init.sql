@@ -47,35 +47,45 @@ CREATE TABLE reminders (
     sent_at     timestamptz,
     canceled_at timestamptz,
     created_at  timestamptz NOT NULL DEFAULT now(),
-    CONSTRAINT reminders_event_kind_due_key UNIQUE (event_id, kind, due_at),
     CONSTRAINT reminders_kind_check CHECK (kind IN (
         'pre_event_3d', 'pre_event_1d', 'ticket_nag', 'snooze_resurface'
     )),
     CONSTRAINT reminders_sent_or_canceled CHECK (sent_at IS NULL OR canceled_at IS NULL)
 );
 
+-- Idempotency: never two live reminders of the same kind at the same time for an event.
+-- Canceled rows don't count, so re-joining an event can recreate the same reminder.
+CREATE UNIQUE INDEX reminders_event_kind_due_key ON reminders (event_id, kind, due_at)
+    WHERE canceled_at IS NULL;
+-- At most one *pending* reminder per (event, kind): repeating a transition (double tap,
+-- webhook retry, second snooze) cannot start a second chain. The reminder job schedules the
+-- next ticket_nag only after the previous one is sent.
+CREATE UNIQUE INDEX reminders_one_pending_per_kind ON reminders (event_id, kind)
+    WHERE sent_at IS NULL AND canceled_at IS NULL;
+
 -- Reminder job: due and still pending.
 CREATE INDEX reminders_pending_due_idx ON reminders (due_at)
-    WHERE sent_at IS NULL AND canceled_at IS NULL;
--- Cancel pending reminders for one event.
-CREATE INDEX reminders_pending_event_idx ON reminders (event_id)
     WHERE sent_at IS NULL AND canceled_at IS NULL;
 
 CREATE TABLE messages (
     id                   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     direction            text        NOT NULL,
-    wa_message_id        text        NOT NULL,
+    wa_message_id        text,                    -- NULL only for outbound rows not yet accepted
     event_id             bigint      REFERENCES events (id) ON DELETE SET NULL,
     quoted_wa_message_id text,
     body                 text,
     template_name        text,
     created_at           timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT messages_wa_message_id_key UNIQUE (wa_message_id),
-    CONSTRAINT messages_direction_check CHECK (direction IN ('inbound', 'outbound'))
+    CONSTRAINT messages_direction_check CHECK (direction IN ('inbound', 'outbound')),
+    CONSTRAINT messages_inbound_has_wa_id
+        CHECK (direction = 'outbound' OR wa_message_id IS NOT NULL)
 );
 
--- "Latest message about an event" fallback when resolving a reply.
-CREATE INDEX messages_event_created_idx ON messages (event_id, created_at DESC);
+CREATE INDEX messages_event_id_idx ON messages (event_id);
+-- "Latest message about any event" fallback when resolving a reply.
+CREATE INDEX messages_latest_event_message_idx ON messages (created_at DESC)
+    WHERE event_id IS NOT NULL;
 
 CREATE TABLE preferences (
     id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
