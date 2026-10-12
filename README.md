@@ -21,17 +21,17 @@ tools, never raw SQL.
 
 ```mermaid
 flowchart TD
+    task["Claude scheduled task<br/>weekly web search"] -- "ingest MCP<br/>(public, 3 tools)" --> app
     me([Me on WhatsApp]) <--> kapso[Kapso]
-    kapso -- webhook: replies --> api[Webhook API<br/>FastAPI]
-    api -- button payloads --> mcp
-    api -- free text --> agent[Claude agent<br/>tool use]
-    discovery[Discovery job<br/>daily] --> agent
-    agent --> mcp[Events MCP server<br/>domain tools only]
-    mcp --> domain[Domain<br/>state machine + reminder rules]
-    domain --> db[(Postgres)]
-    reminder[Reminder job<br/>hourly, no LLM] --> db
-    reminder --> sender[Sender interface]
-    discovery --> sender
+    kapso -- webhook: replies --> app
+    subgraph app["FastAPI app"]
+        ingest["/mcp ingest:<br/>validate, dedupe, filter"]
+        webhook["/webhooks/kapso"] --> agent["Claude agent +<br/>internal domain tools"]
+    end
+    ingest --> db[(Postgres<br/>state machine)]
+    agent --> db
+    jobs["Digest, reminder and heartbeat jobs<br/>(no LLM)"] <--> db
+    jobs --> sender[Sender interface]
     agent --> sender
     sender -- templates / messages --> kapso
 ```
@@ -43,7 +43,8 @@ Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - Python 3.12, [uv](https://docs.astral.sh/uv/)
 - Postgres 16, plain SQL migrations, psycopg 3 (no ORM)
 - Pydantic for schemas
-- FastAPI (webhook), MCP Python SDK, Anthropic SDK (later milestones)
+- FastAPI (webhook + ingest MCP in one app), MCP Python SDK, Anthropic SDK (later milestones)
+- Claude scheduled task for weekly discovery ([prompt](prompts/discovery.md))
 - Kapso for WhatsApp (later milestones)
 - pytest, pytest-cov, ruff, pre-commit, GitHub Actions
 
@@ -66,11 +67,11 @@ uv run ruff check . && uv run ruff format --check .
 - [ ] **M0 Foundations**: repo, docs, CI, Docker Postgres
 - [ ] **M1 Schema + state machine**: tested transitions and reminder rules
 - [ ] **M2 Reminder job**: due reminders sent via a fake console sender
-- [ ] **M3 Events MCP server**: domain tools over MCP
+- [ ] **M3 Ingest MCP + public deployment**: authenticated public `/mcp`, scheduled task submits events
 - [ ] **M4 Agent + evals**: terminal chat works; 30+ eval cases pass in CI
 - [ ] **M5 Webhook + Kapso**: real WhatsApp two-way, templates, buttons
-- [ ] **M6 Discovery job**: daily digest filtered by preferences
-- [ ] **M7 Hardening**: observability, retries, deploy, README polish
+- [ ] **M6 Digest job + heartbeat**: weekly capped digest, "show more", Monday no-ingest alert
+- [ ] **M7 Hardening**: observability, retries, README polish
 
 ## Docs
 
