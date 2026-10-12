@@ -5,13 +5,24 @@ from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
-from psycopg import errors
+from psycopg import errors, sql
 from psycopg.types.json import Jsonb
 
 pytestmark = pytest.mark.integration
 
 DUBLIN = ZoneInfo("Europe/Dublin")
 STARTS_AT = datetime(2026, 11, 5, 18, 30, tzinfo=UTC)
+
+
+def insert_row(db: psycopg.Connection, table: str, values: dict) -> int:
+    query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING id").format(
+        sql.Identifier(table),
+        sql.SQL(", ").join(map(sql.Identifier, values)),
+        sql.SQL(", ").join(map(sql.Placeholder, values)),
+    )
+    row = db.execute(query, values).fetchone()
+    assert row is not None
+    return row[0]
 
 
 def insert_event(db: psycopg.Connection, **overrides) -> int:
@@ -22,27 +33,13 @@ def insert_event(db: psycopg.Connection, **overrides) -> int:
         "starts_at": STARTS_AT,
         **overrides,
     }
-    columns = ", ".join(values)
-    placeholders = ", ".join(f"%({k})s" for k in values)
-    row = db.execute(
-        f"INSERT INTO events ({columns}) VALUES ({placeholders}) RETURNING id",  # noqa: S608
-        values,
-    ).fetchone()
-    assert row is not None
-    return row[0]
+    return insert_row(db, "events", values)
 
 
 def insert_reminder(db: psycopg.Connection, event_id: int, **overrides) -> int:
     values = {"event_id": event_id, "kind": "pre_event_3d", "due_at": STARTS_AT - timedelta(3)}
     values.update(overrides)
-    columns = ", ".join(values)
-    placeholders = ", ".join(f"%({k})s" for k in values)
-    row = db.execute(
-        f"INSERT INTO reminders ({columns}) VALUES ({placeholders}) RETURNING id",  # noqa: S608
-        values,
-    ).fetchone()
-    assert row is not None
-    return row[0]
+    return insert_row(db, "reminders", values)
 
 
 # --- events ------------------------------------------------------------------
@@ -171,10 +168,52 @@ def test_duplicate_reminder_is_rejected(db):
         insert_reminder(db, event_id)
 
 
-def test_same_kind_at_different_times_is_allowed(db):
+def test_only_one_pending_reminder_per_kind(db):
     event_id = insert_event(db)
     insert_reminder(db, event_id, kind="ticket_nag", due_at=STARTS_AT - timedelta(days=9))
+    with pytest.raises(errors.UniqueViolation), db.transaction():
+        insert_reminder(db, event_id, kind="ticket_nag", due_at=STARTS_AT - timedelta(days=6))
+
+
+def test_next_reminder_of_a_kind_allowed_once_previous_is_sent(db):
+    event_id = insert_event(db)
+    first = STARTS_AT - timedelta(days=9)
+    insert_reminder(db, event_id, kind="ticket_nag", due_at=first, sent_at=first)
     insert_reminder(db, event_id, kind="ticket_nag", due_at=STARTS_AT - timedelta(days=6))
+
+
+def test_different_kinds_can_be_pending_together(db):
+    event_id = insert_event(db)
+    insert_reminder(db, event_id, kind="pre_event_3d")
+    insert_reminder(db, event_id, kind="ticket_nag", due_at=STARTS_AT - timedelta(days=9))
+
+
+def test_canceled_reminder_can_be_recreated_with_same_due_at(db):
+    event_id = insert_event(db)
+    canceled_at = datetime(2026, 10, 20, tzinfo=UTC)
+    insert_reminder(db, event_id, canceled_at=canceled_at)
+    insert_reminder(db, event_id)  # e.g. cancelled then going again
+
+
+def test_sent_reminder_blocks_identical_reminder(db):
+    event_id = insert_event(db)
+    due = STARTS_AT - timedelta(days=3)
+    insert_reminder(db, event_id, due_at=due, sent_at=due)
+    with pytest.raises(errors.UniqueViolation), db.transaction():
+        insert_reminder(db, event_id, due_at=due)
+
+
+def test_pending_reminder_insert_can_be_ignored_with_on_conflict(db):
+    event_id = insert_event(db)
+    insert_reminder(db, event_id, kind="snooze_resurface", due_at=STARTS_AT - timedelta(days=10))
+    cur = db.execute(
+        """
+        INSERT INTO reminders (event_id, kind, due_at) VALUES (%s, 'snooze_resurface', %s)
+        ON CONFLICT (event_id, kind) WHERE sent_at IS NULL AND canceled_at IS NULL DO NOTHING
+        """,
+        (event_id, STARTS_AT - timedelta(days=8)),
+    )
+    assert cur.rowcount == 0
 
 
 def test_reminder_cannot_be_both_sent_and_canceled(db):
@@ -213,9 +252,14 @@ def test_messages_reject_invalid_direction(db, direction):
         insert_message(db, direction=direction)
 
 
-def test_messages_require_wa_message_id(db):
-    with pytest.raises(errors.NotNullViolation), db.transaction():
-        insert_message(db, wa_message_id=None)
+def test_inbound_messages_require_wa_message_id(db):
+    with pytest.raises(errors.CheckViolation), db.transaction():
+        insert_message(db, direction="inbound", wa_message_id=None)
+
+
+def test_outbound_messages_may_be_recorded_before_whatsapp_assigns_an_id(db):
+    insert_message(db, direction="outbound", wa_message_id=None)
+    insert_message(db, direction="outbound", wa_message_id=None)  # NULLs don't collide
 
 
 # --- preferences -------------------------------------------------------------
